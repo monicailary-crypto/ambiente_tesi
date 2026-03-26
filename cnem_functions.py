@@ -80,13 +80,40 @@ def _prepare_cnem2d_inputs(xyz: np.ndarray, boundary_facets=None):
         nb_front  = (len(bdy_indices),)
         ind_front = tuple(int(i) for i in bdy_indices)
     else:
-        # Contorno convesso 2D calcolato direttamente sui punti proiettati.
-        # NOTA: ConvexHull in 2D restituisce simplices di shape (M, 2),
-        # ovvero segmenti — NON triangoli. hull.vertices contiene già
-        # gli indici del contorno ordinati, pronti per cnem2d.
+        # Contorno convesso 2D calcolato sui punti proiettati.
+        # ATTENZIONE: hull.vertices è un insieme NON ordinato di indici.
+        # cnem2d richiede un contorno CONNESSO (nodi adiacenti in sequenza).
+        # Lo costruiamo percorrendo i simplici (segmenti) dell'hull.
         if N >= 3:
+            from collections import defaultdict
             hull = ConvexHull(xy2d)
-            bdy_indices = [int(i) for i in hull.vertices]
+            # Grafo di adiacenza dai segmenti del bordo 2D
+            adj_hull = defaultdict(set)
+            for s in hull.simplices:
+                adj_hull[int(s[0])].add(int(s[1]))
+                adj_hull[int(s[1])].add(int(s[0]))
+            # Percorso connesso (ogni nodo ha esattamente 2 vicini sul bordo convesso)
+            start = int(hull.simplices[0, 0])
+            path = [start]
+            visited = {start}
+            current = start
+            for _ in range(len(hull.vertices) - 1):
+                for nxt in sorted(adj_hull[current]):
+                    if nxt not in visited:
+                        path.append(nxt)
+                        visited.add(nxt)
+                        current = nxt
+                        break
+            # Assicura orientamento CCW (area con segno > 0) come atteso da cnem2d
+            pts = xy2d[path]
+            n_bdy = len(pts)
+            area = 0.5 * sum(
+                pts[i, 0] * pts[(i+1) % n_bdy, 1] - pts[(i+1) % n_bdy, 0] * pts[i, 1]
+                for i in range(n_bdy)
+            )
+            if area < 0:
+                path = list(reversed(path))
+            bdy_indices = path
         else:
             bdy_indices = list(range(N))
         nb_front  = (len(bdy_indices),)
