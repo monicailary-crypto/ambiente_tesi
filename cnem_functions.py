@@ -74,21 +74,23 @@ def _prepare_cnem2d_inputs(xyz: np.ndarray, boundary_facets=None):
 
     # --- Contorno di bordo ---
     if boundary_facets is not None:
-        # boundary_facets: (M, 2) — segmenti [i, j]
-        # Costruiamo un unico contorno ordinato a partire dai segmenti
+        # boundary_facets: (M, 2) — segmenti di bordo già estratti
+        # (prodotti da _triangles_to_boundary_segments su triangolazione 3D)
         bdy_indices = _order_boundary_segments(boundary_facets)
         nb_front  = (len(bdy_indices),)
         ind_front = tuple(int(i) for i in bdy_indices)
     else:
-        # Calcolo contorno convesso come fallback
+        # Contorno convesso 2D calcolato direttamente sui punti proiettati.
+        # NOTA: ConvexHull in 2D restituisce simplices di shape (M, 2),
+        # ovvero segmenti — NON triangoli. hull.vertices contiene già
+        # gli indici del contorno ordinati, pronti per cnem2d.
         if N >= 3:
             hull = ConvexHull(xy2d)
-            # hull.vertices: indici in senso antiorario
-            bdy_indices = list(hull.vertices)
+            bdy_indices = [int(i) for i in hull.vertices]
         else:
             bdy_indices = list(range(N))
         nb_front  = (len(bdy_indices),)
-        ind_front = tuple(int(i) for i in bdy_indices)
+        ind_front = tuple(bdy_indices)
 
     return xy_flat, nb_front, ind_front, pca_axes, xy2d
 

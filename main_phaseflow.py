@@ -29,15 +29,7 @@ import numpy as np
 from pathlib import Path
 from scipy.signal import butter, filtfilt
 
-from cnem_functions import _prepare_cnem2d_inputs
-from cnem_functions import _order_boundary_segments
-from cnem_functions import _parse_scni_output
 
-from brain_functions import phases_nodes
-from brain_functions import grad_B_cnem
-from brain_functions import _triangles_to_boundary_segments
-from brain_functions import grad_cnem
-from brain_functions import phaseflow_cnem
 
 
 # =========================================================================== #
@@ -251,6 +243,8 @@ def run_pipeline(edf_path:  str,
         'dt'        – float: passo temporale (s)
         'n_samples' – int: campioni analizzati
     """
+    from brain_functions import phases_nodes, grad_B_cnem, grad_cnem, phaseflow_cnem
+
     # ------------------------------------------------------------------ #
     # STEP 1: Caricamento EDF                                             #
     # ------------------------------------------------------------------ #
@@ -325,7 +319,6 @@ def run_pipeline(edf_path:  str,
     # phases_nodes si aspetta (T, N): trasponiamo
     yp = data_filtered.T   # (T, N)
 
-    from brain_functions import phases_nodes
     yphasep = phases_nodes(yp)   # (T, N)
     print(f"  yphasep shape : {yphasep.shape}")
     print(f"  range fase    : [{yphasep.min():.2f}, {yphasep.max():.2f}] rad")
@@ -339,7 +332,6 @@ def run_pipeline(edf_path:  str,
 
     dt = 1.0 / edf["sfreq"]
 
-    from brain_functions import phaseflow_cnem
     v = phaseflow_cnem(yphasep, loc, dt, speedonlyflag=speed_only)
 
     print(f"\n  vnormp shape  : {v['vnormp'].shape}")

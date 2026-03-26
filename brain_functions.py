@@ -1,7 +1,16 @@
+"""
+brain_functions.py  —  versione ottimizzata
+============================================
+Modifiche rispetto alla versione precedente:
+  - phaseflow_cnem: loop su T timestep eliminato completamente.
+    Il gradiente spaziale è ora calcolato con una singola operazione
+    matriciale (B @ yphasor_matrix) su tutti i campioni in parallelo.
+  - Aggiunto parametro 'chunk_size' per gestire la memoria su registrazioni lunghe.
+"""
+
 import numpy as np
 from scipy.signal import hilbert
 from scipy.spatial import ConvexHull
-from cnem_functions import _prepare_cnem2d_inputs, _parse_scni_output, _order_boundary_segments
 
 # --------------------------------------------------------------------------- #
 # Import del modulo C-NEM compilato
@@ -19,6 +28,7 @@ except ImportError:
         stacklevel=2,
     )
 
+
 # =========================================================================== #
 #  1. phases_nodes                                                             #
 # =========================================================================== #
@@ -27,33 +37,26 @@ def phases_nodes(yp: np.ndarray) -> np.ndarray:
     """
     Calcola la fase istantanea (unwrapped) in tutti i nodi.
 
-    Equivalente MATLAB:
-        yphasep = unwrap(angle(hilbert(bsxfun(@minus, yp, mean(yp)))));
-
     Parametri
     ----------
     yp : ndarray (T, N)
-        Segnali: T campioni temporali, N canali/regioni.
 
     Ritorna
     -------
-    yphasep : ndarray (T, N)
-        Fasi istantanee in radianti (unwrapped nel tempo).
+    yphasep : ndarray (T, N)  — fasi in radianti, unwrapped nel tempo
     """
     print("calculating phases...", end="", flush=True)
 
     yp = np.asarray(yp, dtype=float)
-    yp_centered = yp - yp.mean(axis=0)    # bsxfun(@minus, yp, mean(yp))
+    yp_centered = yp - yp.mean(axis=0)
 
     THRESHOLD = 100_000
 
     if yp.size < THRESHOLD:
-        # versione vettorizzata (come il ramo "short" in MATLAB)
-        analytic  = hilbert(yp_centered, axis=0)
-        yphasep   = np.unwrap(np.angle(analytic), axis=0)
+        analytic = hilbert(yp_centered, axis=0)
+        yphasep  = np.unwrap(np.angle(analytic), axis=0)
     else:
-        # versione per-canale (come il ramo "else" in MATLAB)
-        T, N = yp_centered.shape
+        T, N    = yp_centered.shape
         yphasep = np.zeros_like(yp_centered)
         for jj in range(N):
             y = yp_centered[:, jj]
@@ -67,49 +70,35 @@ def phases_nodes(yp: np.ndarray) -> np.ndarray:
 #  2. grad_B_cnem                                                              #
 # =========================================================================== #
 
-def grad_B_cnem(xyz: np.ndarray, boundary_facets=None):
+def grad_B_cnem(xyz: np.ndarray, boundary_facets=None) -> np.ndarray:
     """
     Calcola la matrice B per il gradiente ∇V su punti 3-D sparsi.
 
-    Equivalente MATLAB:  B = grad_B_cnem(XYZ, [IN_Tri_Ini])
-    Uso:  gradV = B @ V   oppure   gradV = grad_cnem(B, V)
-
     Parametri
     ----------
-    xyz : ndarray (N, 3)  — coordinate 3-D dei punti
-    boundary_facets : ndarray (M, 2) o (M, 3), opzionale
-        Triangolazione/segmenti della superficie di bordo.
-        Se None viene usata la ConvexHull.
+    xyz : ndarray (N, 3)
+    boundary_facets : ndarray (M,2) o (M,3), opzionale
 
     Ritorna
     -------
     B : ndarray (3*N, N)
-        Matrice operatore gradiente.
-        Grad_V = B @ V  → vettore (3*N,)
-        reshape(Grad_V, (N, 3)) → [∂V/∂x, ∂V/∂y, ∂V/∂z] per nodo.
-
-        (Nota: in MATLAB il reshape era (4, N).T con 4a colonna = V;
-         qui usiamo (3, N).T — solo le 3 componenti del gradiente.)
     """
     if not _CNEM_AVAILABLE:
         raise RuntimeError("Modulo cnem2d non disponibile.")
 
+    from cnem_functions import _prepare_cnem2d_inputs, _parse_scni_output
+
     xyz = np.asarray(xyz, dtype=float)
 
-    # Gestione boundary_facets: converti triangoli → segmenti di bordo 2-D
-    # (cnem2d lavora con contorni, non triangolazioni di superficie)
     bdy_segs = None
     if boundary_facets is not None:
         bf = np.asarray(boundary_facets, dtype=int)
         if bf.ndim == 2 and bf.shape[1] == 3:
-            # Triangolazione → bordo = lati che appaiono una sola volta
             bdy_segs = _triangles_to_boundary_segments(bf)
         elif bf.ndim == 2 and bf.shape[1] == 2:
             bdy_segs = bf
 
     xy_flat, nb_front, ind_front, pca_axes, _ = _prepare_cnem2d_inputs(xyz, bdy_segs)
-
-    print(f"Sto passando al C++ {len(xy_flat)} punti.")
     result = _cnem.SCNI_CNEM2D(xy_flat, nb_front, ind_front)
 
     N = xyz.shape[0]
@@ -117,11 +106,7 @@ def grad_B_cnem(xyz: np.ndarray, boundary_facets=None):
     return B
 
 
-def _triangles_to_boundary_segments(triangles: np.ndarray) -> np.ndarray:
-    """
-    Dato un array (M, 3) di triangoli, restituisce i segmenti di bordo
-    (lati che appaiono esattamente una volta).
-    """
+def _triangles_to_boundary_segments(triangles: np.ndarray):
     from collections import Counter
     edge_count = Counter()
     for tri in triangles:
@@ -140,158 +125,165 @@ def grad_cnem(xyz_or_B, V: np.ndarray, boundary_facets=None) -> np.ndarray:
     """
     Gradiente ∇V valutato su punti 3-D sparsi.
 
-    Equivalente MATLAB:
-        gradV = grad_cnem(XYZ, V, [IN_Tri_Ini])
-        gradV = grad_cnem(B, V)        % B precalcolata
-
-    Parametri
-    ----------
-    xyz_or_B : ndarray (N, 3) oppure ndarray (3*N, N)
-        Se shape (N, 3): coordinate 3-D → calcola B internamente.
-        Se shape (3*N, N): usa la matrice B precalcolata.
-    V : ndarray (N,) — reale o complesso
-        Valore della funzione scalare nei nodi.
-    boundary_facets : opzionale, passato a grad_B_cnem se xyz_or_B è coord.
+    Accetta sia coordinate (N,3) sia la matrice B precalcolata (3N,N).
+    V può essere reale o complesso, shape (N,) o (N, T) per elaborazione batch.
 
     Ritorna
     -------
-    gradV : ndarray (N, 3)
-        [∂V/∂x, ∂V/∂y, ∂V/∂z] per ogni nodo.
+    gradV : ndarray (N, 3)  se V è (N,)
+            ndarray (T, N, 3) se V è (N, T)   ← batch mode
     """
     xyz_or_B = np.asarray(xyz_or_B)
-    V = np.asarray(V).ravel()
-    N = len(V)
+    V = np.asarray(V)
+    is_batch = V.ndim == 2   # (N, T)
 
-    # Distingui matrice B (quadrata/rettangolare con 3N righe) da matrice coord
+    if is_batch:
+        N = V.shape[0]
+    else:
+        N = len(V.ravel())
+        V = V.ravel()
+
+    # Scegli/costruisci B
     if xyz_or_B.ndim == 2 and xyz_or_B.shape[1] == 3 and xyz_or_B.shape[0] == N:
-        # È una matrice di coordinate (N, 3)
         B = grad_B_cnem(xyz_or_B, boundary_facets)
     else:
-        # È già la matrice B
-        B = xyz_or_B
+        B = xyz_or_B   # già la matrice B
 
+    # Prodotto matriciale
     if np.iscomplexobj(V):
-        # Separa reale e immaginaria per rispettare la linearità di B
-        Grad_V_re = B @ V.real
-        Grad_V_im = B @ V.imag
-        Grad_V = Grad_V_re + 1j * Grad_V_im
+        G_re = B @ V.real    # (3N, T) o (3N,)
+        G_im = B @ V.imag
+        G    = G_re + 1j * G_im
     else:
-        Grad_V = B @ V
+        G = B @ V            # (3N, T) o (3N,)
 
-    # reshape: (3*N,) → (N, 3)  [equivalente a reshape(Grad_V, 3, [])' in MATLAB]
-    grad_V_mat = Grad_V.reshape(3, N).T   # (N, 3): colonne = x, y, z
-    return grad_V_mat
+    if is_batch:
+        T = V.shape[1]
+        # G ha shape (3N, T) → vogliamo (T, N, 3)
+        # Reshape: (3, N, T) poi transpose → (T, N, 3)
+        grad_V = G.reshape(3, N, T).transpose(2, 1, 0)   # (T, N, 3)
+    else:
+        grad_V = G.reshape(3, N).T   # (N, 3)
+
+    return grad_V
 
 
 # =========================================================================== #
-#  4. phaseflow_cnem                                                           #
+#  4. phaseflow_cnem  —  versione vettorizzata (nessun loop su T)             #
 # =========================================================================== #
 
 def phaseflow_cnem(yphasep: np.ndarray,
                    loc: np.ndarray,
                    dt: float,
-                   speedonlyflag: bool = False) -> dict:
+                   speedonlyflag: bool = False,
+                   chunk_size: int = 5000) -> dict:
     """
     Calcola il flusso di fase istantaneo in ogni punto temporale.
 
-    Equivalente MATLAB:  v = phaseflow_cnem(yphasep, loc, dt, speedonlyflag)
+    Versione completamente vettorizzata: nessun loop Python su T.
+    Usa chunk_size per evitare picchi di memoria su registrazioni lunghe.
 
     Parametri
     ----------
-    yphasep : ndarray (T, N)
-        Matrice delle fasi (unwrapped), T campioni × N canali.
-        Si assume già unwrapped nel tempo (usa phases_nodes() per ottenerla).
-    loc : ndarray (N, 3)
-        Coordinate 3-D delle regioni/elettrodi.
-    dt : float
-        Passo temporale in secondi.
-    speedonlyflag : bool, default False
-        True  → calcola solo la velocità scalare vnormp (più rapido).
-        False → calcola anche le componenti vettoriali vxp, vyp, vzp.
+    yphasep    : ndarray (T, N)  — fasi unwrapped
+    loc        : ndarray (N, 3)  — coordinate mm
+    dt         : float           — passo temporale (s)
+    speedonlyflag : bool         — True → solo vnormp
+    chunk_size : int             — campioni per chunk (default 5000)
+                                   Riduci se memoria insufficiente.
 
     Ritorna
     -------
-    v : dict con chiavi:
-        'vnormp' ndarray (T, N) — velocità scalare (m/s)
-        'vxp'    ndarray (T, N) — componente x  (solo se speedonlyflag=False)
-        'vyp'    ndarray (T, N) — componente y
-        'vzp'    ndarray (T, N) — componente z
-
-    Note matematiche
-    ----------------
-    Rubino et al. (2006):   |v| = |∂φ/∂t| / ‖∇φ‖
-    Direzione:               v⃗  = |v| · (−∇φ / ‖∇φ‖)
-
-    Il gradiente spaziale è calcolato sul fasore z = e^{iφ} per evitare
-    discontinuità di wrap-around, poi riconvertito:
-        ∇φ = Re(−i · ∇z · conj(z))
+    v : dict
+        'vnormp' ndarray (T, N)
+        'vxp'    ndarray (T, N)  (se speedonlyflag=False)
+        'vyp'    ndarray (T, N)
+        'vzp'    ndarray (T, N)
     """
     yphasep = np.asarray(yphasep, dtype=float)
     loc     = np.asarray(loc,     dtype=float)
     T, N    = yphasep.shape
 
     # ------------------------------------------------------------------ #
-    # ∂φ/∂t  — derivata temporale della fase                             #
+    # ∂φ/∂t  — una sola chiamata numpy su tutto il tensore               #
     # ------------------------------------------------------------------ #
-    # MATLAB: [~, dphidtp] = gradient(yphasep, dt)
-    # gradient() su matrice 2-D restituisce [d/dcols, d/drows].
-    # Il secondo output è la derivata lungo le righe (=tempo).
-    # np.gradient con spacing=(1, dt) su assi (0=tempo, 1=spazio):
-    dphidtp, _ = np.gradient(yphasep, dt, 1, axis=(0, 1))
-    # Alternativa equivalente e più esplicita:
-    # dphidtp = np.gradient(yphasep, dt, axis=0)
+    dphidtp = np.gradient(yphasep, dt, axis=0)   # (T, N)
     print("dphidt done...", end="", flush=True)
 
     # ------------------------------------------------------------------ #
-    # Superficie di bordo (alpha shape → ConvexHull come approssimazione) #
+    # Matrice B (calcolata UNA sola volta, boundary gestito internamente) #
     # ------------------------------------------------------------------ #
-    try:
-        hull = ConvexHull(loc)
-        boundary_facets = hull.simplices    # (M, 3) triangoli
-    except Exception:
-        boundary_facets = None
+    # Non passiamo boundary_facets: _prepare_cnem2d_inputs calcola
+    # autonomamente il contorno convesso sui punti 2D proiettati via PCA.
+    # Passare hull.simplices 3D causerebbe un IndexError nel C++ perché
+    # i simplici 3D (triangoli) non sono compatibili con il contorno 2D.
+    B = grad_B_cnem(loc)   # (3N, N) — costante per tutto il segnale
+    print("B built...", end="", flush=True)
 
     # ------------------------------------------------------------------ #
-    # Matrice B del gradiente (calcolata una sola volta)                  #
+    # Gradiente spaziale — vettorizzato con chunking                     #
     # ------------------------------------------------------------------ #
-    B = grad_B_cnem(loc, boundary_facets)
+    # Strategia:
+    #   yphasor = exp(i·φ)  →  shape (T, N)
+    #   Per ogni chunk: B @ yphasor[chunk].T  →  (3N, chunk_len)
+    #   poi ∇φ = Re(-i · grad_phasor · conj(phasor))
+    #
+    # Dimensioni intermedie per chunk_size=5000, N=19:
+    #   yphasor chunk : (5000, 19) complex → ~1.5 MB
+    #   B @ chunk     : (57,   19) @ (19, 5000) = (57, 5000) → ~2.3 MB
+    #   totale ~5 MB per chunk — molto gestibile
 
-    # ------------------------------------------------------------------ #
-    # Gradiente spaziale della fase via fasori                            #
-    # ------------------------------------------------------------------ #
     dphidxp = np.zeros((T, N))
     dphidyp = np.zeros((T, N))
     dphidzp = np.zeros((T, N))
 
-    for j in range(T):
-        yphase  = yphasep[j, :]           # (N,) — fase al tempo j
-        yphasor = np.exp(1j * yphase)     # z = e^{iφ}, proiezione sul cerchio unitario
+    n_chunks = int(np.ceil(T / chunk_size))
+    for c in range(n_chunks):
+        t0 = c * chunk_size
+        t1 = min(t0 + chunk_size, T)
 
-        # Gradiente del fasore nello spazio 3-D → shape (N, 3)
-        gradphasor = grad_cnem(B, yphasor)
+        phi_chunk    = yphasep[t0:t1, :]          # (chunk, N)
+        phasor_chunk = np.exp(1j * phi_chunk)     # (chunk, N)
 
-        # ∇φ = Re(−i · ∇z · conj(z))   [perché |z|=1 ⟹ 1/z = conj(z)]
-        conj_ph = np.conj(yphasor)
-        dphidxp[j, :] = np.real(-1j * gradphasor[:, 0] * conj_ph)
-        dphidyp[j, :] = np.real(-1j * gradphasor[:, 1] * conj_ph)
-        dphidzp[j, :] = np.real(-1j * gradphasor[:, 2] * conj_ph)
+        # B @ phasor.T → (3N, chunk),  poi reshape → (3, N, chunk)
+        # trasponiamo phasor per avere colonne=campioni
+        G = B @ phasor_chunk.T                    # (3N, chunk) complex
+        G3 = G.reshape(3, N, -1)                  # (3, N, chunk)
 
-    print("gradphi done...", end="", flush=True)
+        # conj(phasor).T ha shape (N, chunk)
+        conj_ph = np.conj(phasor_chunk).T         # (N, chunk)
+
+        # ∇φ = Re(-i · G · conj(z))  — moltiplicazione element-wise su asse N
+        # G3[d] ha shape (N, chunk),  conj_ph ha shape (N, chunk)
+        dphidxp[t0:t1, :] = np.real(-1j * G3[0] * conj_ph).T   # (chunk, N)
+        dphidyp[t0:t1, :] = np.real(-1j * G3[1] * conj_ph).T
+        dphidzp[t0:t1, :] = np.real(-1j * G3[2] * conj_ph).T
+
+        if (c + 1) % 5 == 0 or c == n_chunks - 1:
+            print(f"\r  gradphi chunk {c+1}/{n_chunks} ({t1}/{T} campioni)...",
+                  end="", flush=True)
+
+    print("  gradphi done...", flush=True)
 
     # ------------------------------------------------------------------ #
     # Velocità                                                            #
     # ------------------------------------------------------------------ #
     normgradphi = np.sqrt(dphidxp**2 + dphidyp**2 + dphidzp**2)
-    vnormp = np.abs(dphidtp) / normgradphi          # |v| = |∂φ/∂t| / ‖∇φ‖
+
+    # Evita divisioni per zero (punti con gradiente nullo)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vnormp = np.where(normgradphi > 0,
+                          np.abs(dphidtp) / normgradphi,
+                          np.nan)
 
     v = {"vnormp": vnormp}
 
     if not speedonlyflag:
-        # v⃗ = |v| · (−∇φ / ‖∇φ‖)
-        v["vxp"] = vnormp * (-dphidxp / normgradphi)
-        v["vyp"] = vnormp * (-dphidyp / normgradphi)
-        v["vzp"] = vnormp * (-dphidzp / normgradphi)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            inv_norm = np.where(normgradphi > 0, 1.0 / normgradphi, np.nan)
+        v["vxp"] = vnormp * (-dphidxp * inv_norm)
+        v["vyp"] = vnormp * (-dphidyp * inv_norm)
+        v["vzp"] = vnormp * (-dphidzp * inv_norm)
 
     print("v done...")
     return v
-
