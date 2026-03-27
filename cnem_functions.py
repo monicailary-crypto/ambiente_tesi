@@ -80,40 +80,13 @@ def _prepare_cnem2d_inputs(xyz: np.ndarray, boundary_facets=None):
         nb_front  = (len(bdy_indices),)
         ind_front = tuple(int(i) for i in bdy_indices)
     else:
-        # Contorno convesso 2D calcolato sui punti proiettati.
-        # ATTENZIONE: hull.vertices è un insieme NON ordinato di indici.
-        # cnem2d richiede un contorno CONNESSO (nodi adiacenti in sequenza).
-        # Lo costruiamo percorrendo i simplici (segmenti) dell'hull.
+        # Contorno convesso 2D calcolato direttamente sui punti proiettati.
+        # NOTA: ConvexHull in 2D restituisce simplices di shape (M, 2),
+        # ovvero segmenti — NON triangoli. hull.vertices contiene già
+        # gli indici del contorno ordinati, pronti per cnem2d.
         if N >= 3:
-            from collections import defaultdict
             hull = ConvexHull(xy2d)
-            # Grafo di adiacenza dai segmenti del bordo 2D
-            adj_hull = defaultdict(set)
-            for s in hull.simplices:
-                adj_hull[int(s[0])].add(int(s[1]))
-                adj_hull[int(s[1])].add(int(s[0]))
-            # Percorso connesso (ogni nodo ha esattamente 2 vicini sul bordo convesso)
-            start = int(hull.simplices[0, 0])
-            path = [start]
-            visited = {start}
-            current = start
-            for _ in range(len(hull.vertices) - 1):
-                for nxt in sorted(adj_hull[current]):
-                    if nxt not in visited:
-                        path.append(nxt)
-                        visited.add(nxt)
-                        current = nxt
-                        break
-            # Assicura orientamento CCW (area con segno > 0) come atteso da cnem2d
-            pts = xy2d[path]
-            n_bdy = len(pts)
-            area = 0.5 * sum(
-                pts[i, 0] * pts[(i+1) % n_bdy, 1] - pts[(i+1) % n_bdy, 0] * pts[i, 1]
-                for i in range(n_bdy)
-            )
-            if area < 0:
-                path = list(reversed(path))
-            bdy_indices = path
+            bdy_indices = [int(i) for i in hull.vertices]
         else:
             bdy_indices = list(range(N))
         nb_front  = (len(bdy_indices),)
@@ -160,72 +133,72 @@ def _order_boundary_segments(segments: np.ndarray):
 
 def _parse_scni_output(scni_result, N: int, pca_axes=None):
     """
-    Interpreta l'output di cnem2d.SCNI_CNEM2D e costruisce la matrice B
-    compatibile con la firma MATLAB (Grad_V = B * V).
+    Interpreta l'output di cnem2d.SCNI_CNEM2D e costruisce la matrice B.
+
+    NOTA IMPORTANTE sugli indici:
+    Il sorgente scni_cnem2d.cpp aggiunge +1 agli indici prima di restituirli:
+        P_Vec_Ind_Noeud_New_Old->push_back(ML.Vec_Ind_Noeud_New_Old[i] + 1)
+        P_Vec_Ind_Noeud_Old_New->push_back(ML.Vec_Ind_Noeud_Old_New[i] + 1)
+    Quindi new_old e old_new sono 1-based → sottraiamo 1 prima di usarli.
+
+    Analogamente Vec_INV contiene indici nodo 1-based → sottraiamo 1.
 
     Output di SCNI_CNEM2D (indici 0-7):
-        0: Ind_Noeud_New_Old  — permutazione new→old
-        1: Ind_Noeud_Old_New  — permutazione old→new
+        0: Ind_Noeud_New_Old  — permutazione new→old  (1-based)
+        1: Ind_Noeud_Old_New  — permutazione old→new  (1-based)
         2: Vol_Cel            — volumi celle di Voronoi
         3: XY_CdM             — centri di massa (flat 2*N)
-        4: Nb_Contrib         — numero di contributi per nodo
-        5: INV                — Indice Noeud Voisin (lista vicini)
-        6: Grad               — gradienti NEM (core del calcolo)
+        4: Nb_Contrib         — numero di contributi per nodo (new ordering)
+        5: INV                — indici vicini flat (1-based)
+        6: Grad               — gradienti NEM (valori reali, 0-based)
         7: Tri                — triangolazione
-
-    Vec_Grad ha layout:
-        Per ogni nodo i (nel sistema "new"): Nb_Contrib[i] coppie (j, dφ_j/dx, dφ_j/dy)
-        ovvero: per ogni vicino j del nodo i, il contributo al gradiente.
-
-    La matrice B risultante ha shape (2*N, N) nel caso 2D
-    (o (3*N, N) dopo riproiezione in 3D, con un blocco per asse).
 
     Returns
     -------
-    B : ndarray (dim*N, N) dove dim=2 (o 3 se pca_axes non è None)
-    new_old : ndarray (N,) — mappa indici new→old
-    old_new : ndarray (N,) — mappa indici old→new
+    B : ndarray (3*N, N) se pca_axes non è None, altrimenti (2*N, N)
+    new_old : ndarray (N,) — mappa indici new→old (0-based)
+    old_new : ndarray (N,) — mappa indici old→new (0-based)
     """
-    new_old   = np.array(scni_result[0], dtype=int)   # (N,)
-    old_new   = np.array(scni_result[1], dtype=int)   # (N,)
-    nb_contrib= np.array(scni_result[4], dtype=int)   # (N,) numero vicini per nodo (new ordering)
-    inv       = np.array(scni_result[5], dtype=int)   # lista vicini flat
-    grad_flat = np.array(scni_result[6], dtype=float) # lista gradienti flat
+    # Indici 1-based → converti a 0-based sottraendo 1
+    new_old    = np.array(scni_result[0], dtype=int) - 1   # (N,) 0-based
+    old_new    = np.array(scni_result[1], dtype=int) - 1   # (N,) 0-based
+    nb_contrib = np.array(scni_result[4], dtype=int)       # (N,) — conteggi, non indici
+    inv        = np.array(scni_result[5], dtype=int) - 1   # lista vicini 0-based
+    grad_flat  = np.array(scni_result[6], dtype=float)     # gradienti (valori float, non indici)
 
-    # Dimensione: 2 componenti per 2-D
-    dim_2d = 2
-    # B_2d[d*N + i, j]: contributo del nodo j alla componente d del gradiente al nodo i
-    B_2d = np.zeros((dim_2d * N, N))
+    # Sanity check
+    assert new_old.min() >= 0, f"new_old contiene indici negativi dopo -1: min={new_old.min()}"
+    assert new_old.max() < N,  f"new_old contiene indici >= N: max={new_old.max()}, N={N}"
+    assert inv.min() >= 0,     f"inv contiene indici negativi dopo -1: min={inv.min()}"
+    assert inv.max() < N,      f"inv contiene indici >= N: max={inv.max()}, N={N}"
+
+    # Costruisci B_2d (2*N, N)
+    B_2d = np.zeros((2 * N, N))
 
     pos_inv  = 0
     pos_grad = 0
     for i_new in range(N):
-        nc = nb_contrib[i_new]
-        i_old = new_old[i_new]  # indice nodo nel sistema originale
+        nc    = nb_contrib[i_new]
+        i_old = new_old[i_new]      # indice 0-based nel sistema originale
         for _ in range(nc):
-            j_new  = inv[pos_inv]
+            j_new  = inv[pos_inv]   # 0-based
             j_old  = new_old[j_new]
             gx     = grad_flat[pos_grad]
             gy     = grad_flat[pos_grad + 1]
-            # Contributo del nodo j alla derivata nel nodo i
             B_2d[0 * N + i_old, j_old] += gx   # ∂/∂x
             B_2d[1 * N + i_old, j_old] += gy   # ∂/∂y
             pos_inv  += 1
             pos_grad += 2
 
     if pca_axes is None:
-        # Già 2-D: B ha shape (2N, N)
         return B_2d, new_old, old_new
     else:
-        # Riproiezione 2-D → 3-D tramite PCA
-        # pca_axes: (3, 2), colonne = assi principali nel sistema 3-D
-        # ∇_3D φ = pca_axes @ [∂φ/∂u, ∂φ/∂v]^T
-        # Quindi:  B_3d[d*N:, :] = pca_axes[d, 0] * B_2d[0*N:, :] + pca_axes[d, 1] * B_2d[1*N:, :]
+        # Riproiezione 2D → 3D tramite PCA
         B_3d = np.zeros((3 * N, N))
         for d in range(3):
-            B_3d[d * N:(d + 1) * N, :] = (
-                pca_axes[d, 0] * B_2d[0 * N:1 * N, :]
-                + pca_axes[d, 1] * B_2d[1 * N:2 * N, :]
+            B_3d[d*N:(d+1)*N, :] = (
+                pca_axes[d, 0] * B_2d[0*N:1*N, :]
+                + pca_axes[d, 1] * B_2d[1*N:2*N, :]
             )
         return B_3d, new_old, old_new
 
