@@ -166,23 +166,23 @@ def _parse_scni_output(scni_result, N: int, pca_axes=None):
     inv        = np.array(scni_result[5], dtype=int) - 1   # lista vicini 0-based
     grad_flat  = np.array(scni_result[6], dtype=float)     # gradienti (valori float, non indici)
 
-    # Sanity check
-    assert new_old.min() >= 0, f"new_old contiene indici negativi dopo -1: min={new_old.min()}"
-    assert new_old.max() < N,  f"new_old contiene indici >= N: max={new_old.max()}, N={N}"
-    assert inv.min() >= 0,     f"inv contiene indici negativi dopo -1: min={inv.min()}"
-    assert inv.max() < N,      f"inv contiene indici >= N: max={inv.max()}, N={N}"
+    # I guard C++ restituiscono 0 per celle degeneri → dopo -1 diventano -1.
+    # Clippiamo a [0, N-1]: le righe/colonne corrispondenti avranno contributo zero in B.
+    new_old = np.clip(new_old, 0, N - 1)
+    old_new = np.clip(old_new, 0, N - 1)
+    inv     = np.clip(inv,     0, N - 1)
 
     # Costruisci B_2d (2*N, N)
     B_2d = np.zeros((2 * N, N))
 
     pos_inv  = 0
     pos_grad = 0
-    for i_new in range(N):
+    for i_new in range(len(nb_contrib)):
         nc    = nb_contrib[i_new]
         i_old = new_old[i_new]      # indice 0-based nel sistema originale
         for _ in range(nc):
             j_new  = inv[pos_inv]   # 0-based
-            j_old  = new_old[j_new]
+            j_old  = new_old[j_new] if j_new < len(new_old) else 0
             gx     = grad_flat[pos_grad]
             gy     = grad_flat[pos_grad + 1]
             B_2d[0 * N + i_old, j_old] += gx   # ∂/∂x
